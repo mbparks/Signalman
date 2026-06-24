@@ -615,22 +615,46 @@ detectors.audio = function(getThreshold){
 detectors.video = function(getThreshold, getInvert){
   let stream, raf, onSampleCb, on=false, video, canvas, cctx;
   const HYST = 0.85, MINMS = 12; let lastFlip = 0;
+  async function getStream(){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      throw new Error("Camera needs a secure context (https or localhost).");
+    }
+    const tries = [
+      { video:{ facingMode:{ ideal:"environment" } } },  // prefer rear if present
+      { video:true }                                     // otherwise any camera
+    ];
+    let lastErr;
+    for(const c of tries){
+      try { return await navigator.mediaDevices.getUserMedia(c); }
+      catch(e){ lastErr=e; if(e && e.name==="NotAllowedError") throw e; } // do not retry a denial
+    }
+    throw lastErr;
+  }
   async function start(onSample, videoEl){
     onSampleCb = onSample; video = videoEl;
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
-    video.srcObject = stream; await video.play();
+    stream = await getStream();
+    video.muted = true; video.playsInline = true; video.setAttribute("playsinline","");
+    video.srcObject = stream;
+    await new Promise(res => {
+      if(video.readyState >= 2) return res();
+      video.onloadedmetadata = () => res();
+      setTimeout(res, 1500); // safety net
+    });
+    try { await video.play(); } catch(e){ /* muted autoplay should be allowed */ }
     canvas = document.createElement("canvas"); canvas.width=64; canvas.height=48;
     cctx = canvas.getContext("2d", {willReadFrequently:true});
     const loop = () => {
-      try{
-        cctx.drawImage(video, video.videoWidth*0.25, video.videoHeight*0.25,
-          video.videoWidth*0.5, video.videoHeight*0.5, 0,0,64,48);
-        const d = cctx.getImageData(0,0,64,48).data;
-        let sum=0; for(let i=0;i<d.length;i+=4){ sum += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; }
-        let level = sum/(d.length/4)/255;
-        if(getInvert()) level = 1-level;
-        gate(level);
-      }catch(e){}
+      if(video.videoWidth){
+        try{
+          cctx.drawImage(video, video.videoWidth*0.25, video.videoHeight*0.25,
+            video.videoWidth*0.5, video.videoHeight*0.5, 0,0,64,48);
+          const d = cctx.getImageData(0,0,64,48).data;
+          let sum=0; for(let i=0;i<d.length;i+=4){ sum += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; }
+          let level = sum/(d.length/4)/255;
+          if(getInvert()) level = 1-level;
+          gate(level);
+        }catch(e){}
+      }
       raf = requestAnimationFrame(loop);
     };
     loop();
@@ -799,8 +823,16 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
       $("stagelabel").textContent = currentSrc==="mic"?"Listening":"Watching";
       $("rxNote").textContent="";
     }catch(e){
+      const dev = currentSrc==="mic" ? "Microphone" : "Camera";
+      let msg = dev+" unavailable. Check browser permissions and try again.";
+      if(e){
+        if(e.name==="NotAllowedError" || e.name==="SecurityError") msg = dev+" permission was blocked. Allow access in your browser and retry.";
+        else if(e.name==="NotFoundError" || e.name==="OverconstrainedError") msg = "No "+dev.toLowerCase()+" was found on this device.";
+        else if(e.name==="NotReadableError") msg = dev+" is in use by another app. Close it and retry.";
+        else if(e.message) msg = e.message;
+      }
       $("rxNote").className="note warn";
-      $("rxNote").textContent = (currentSrc==="mic"?"Microphone":"Camera")+" unavailable. Check browser permissions and try again.";
+      $("rxNote").textContent = msg;
       stopListening();
     }
   }
