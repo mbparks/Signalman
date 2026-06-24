@@ -356,6 +356,7 @@
       <label class="row" style="gap:7px;font-size:13px;color:var(--ink-dim)">
         <input type="checkbox" id="invert"> invert (dark flashes)
       </label>
+      <button class="btn ghost" id="selftestBtn">Self-test</button>
       <button class="btn ghost" id="clearBtn" style="margin-left:auto">Clear</button>
     </div>
 
@@ -573,6 +574,7 @@ detectors.audio = function(getThreshold){
     onSampleCb = onSample;
     stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
     ctx = new (window.AudioContext||window.webkitAudioContext)();
+    if(ctx.state==="suspended"){ try{ await ctx.resume(); }catch(e){} }
     const src = ctx.createMediaStreamSource(stream);
     analyser = ctx.createAnalyser(); analyser.fftSize=2048; src.connect(analyser);
     buf = new Uint8Array(analyser.fftSize);
@@ -810,10 +812,14 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
       activeDetector = currentSrc==="mic"
         ? detectors.audio(()=>+thr.value)
         : detectors.video(()=>+thr.value, ()=>$("invert").checked);
+      let prevOn=false, primed=false;
       const onSample = (level, isOn, t) => {
         meterFill.style.width = Math.min(100, level*100)+"%";
         Lamp.level(Math.min(1, level), isOn);
-        decoder.edge(isOn, t);
+        // The decoder measures durations between transitions, so only feed it
+        // when the gated state actually changes (prime once with the start state).
+        if(!primed){ decoder.edge(isOn, t); prevOn=isOn; primed=true; return; }
+        if(isOn !== prevOn){ decoder.edge(isOn, t); prevOn=isOn; }
       };
       if(currentSrc==="mic"){
         await activeDetector.start(onSample);
@@ -867,6 +873,23 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
   $("listenBtn").onclick=startListening;
   $("rxStopBtn").onclick=stopListening;
   $("clearBtn").onclick=()=>{ if(decoder) decoder.reset(); $("rxText").textContent=""; $("rxMorse").textContent=""; };
+  $("selftestBtn").onclick=()=>{
+    // Prove the decode path end to end by feeding synthetic on/off edges
+    // for a known message at a fixed timing, bypassing mic and camera.
+    const w = 18;
+    const td = SIGNALMAN.makeDecoder({ wpm:w, adaptive:()=>false, onChange:(text,pending)=>{
+      $("rxText").textContent = text;
+      $("rxMorse").textContent = pending ? Morse.pretty(pending) : "";
+    }});
+    const ev = SIGNALMAN.Timing.plan("SOS HELLO", w, w);
+    let tt = 0;
+    td.edge(false, tt);                       // prime with the idle state
+    ev.forEach(e => { td.edge(e.on, tt); tt += e.ms; });
+    td.edge(false, tt);                       // close the final mark
+    td.idle(tt + td.unit*10);                 // flush the last character
+    $("rxNote").className="note";
+    $("rxNote").textContent = "Self-test fed SOS HELLO directly into the decoder. If you see it above, decoding works and any live issue is the camera or mic capture or the threshold.";
+  };
   $("calBtn").onclick=async ()=>{
     if(!activeDetector || !activeDetector.sampleFloor){ $("rxNote").className="note"; $("rxNote").textContent="Start listening first, then calibrate against the ambient room."; return; }
     $("rxNote").className="note"; $("rxNote").textContent="Sampling ambient for 1.5 s. Keep the source quiet/dark...";
