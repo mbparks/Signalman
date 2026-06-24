@@ -525,24 +525,25 @@ const Transmitter = (() => {
    Decoder: on/off edges -> Morse -> text (adaptive timing)
    ========================================================= */
 function makeDecoder(opts){
-  let ditMs = Timing.unit(opts.wpm)||80;
-  let dahMs = ditMs*3;
+  let unitMs = Timing.unit(opts.wpm)||80;     // estimated length of one dot unit
   let buffer="", out="", lastOn=false, lastT=null;
-  const MIN_MARK = 18;   // marks shorter than this are noise, never code
+  let marks=[], gaps=[];                       // recent raw durations, for diagnostics
+  const MIN_MARK = 18;                          // shorter than this is noise, never code
   const cb = opts.onChange || (()=>{});
-  function flushChar(){
-    if(buffer){
-      const ch = Morse.fromMorse(buffer) || "\u00BF";
-      out += ch; buffer="";
-    }
-  }
+  function note(arr,v){ arr.push(Math.round(v)); if(arr.length>8) arr.shift(); }
+  function flushChar(){ if(buffer){ out += Morse.fromMorse(buffer) || "\u00BF"; buffer=""; } }
   function emit(){ cb(out, buffer); }
-  function unit(){ return ditMs; }
+  // Pull the unit estimate toward a measured one-unit interval. Both dits and
+  // intra-element gaps are one unit; gaps are never clipped, so they keep the
+  // estimate honest even when the gate shortens the marks.
+  function learn(d){ if(opts.adaptive()){ unitMs += (d-unitMs)*0.15; unitMs = Math.max(15, Math.min(400, unitMs)); } }
   return {
-    get unit(){ return ditMs; },
-    get wpm(){ return Math.round(1200/ditMs); },
-    setWpm(w){ ditMs = Timing.unit(w); dahMs = ditMs*3; },
-    reset(){ buffer=""; out=""; lastOn=false; lastT=null; emit(); },
+    get unit(){ return unitMs; },
+    get wpm(){ return Math.round(1200/unitMs); },
+    get marks(){ return marks.slice(); },
+    get gaps(){ return gaps.slice(); },
+    setWpm(w){ unitMs = Timing.unit(w); },
+    reset(){ buffer=""; out=""; lastOn=false; lastT=null; marks=[]; gaps=[]; emit(); },
     text(){ return out; },
     // a transition: signal became `on` at time `t` (ms)
     edge(on, t){
@@ -550,29 +551,23 @@ function makeDecoder(opts){
       const dur = t - lastT;
       if(lastOn){ // a mark just ended
         if(dur < MIN_MARK){ lastT=t; lastOn=on; return; } // reject spike
-        // classify against the midpoint of the dit and dah estimates
-        const boundary = (ditMs + dahMs) / 2;
-        const isDah = dur > boundary;
+        note(marks, dur);
+        const isDah = dur > unitMs*2;          // 2 units sits between a dit (1u) and a dah (3u)
         buffer += isDah ? "-" : ".";
-        if(opts.adaptive()){
-          if(isDah){ dahMs += (dur - dahMs)*0.2; }
-          else     { ditMs += (dur - ditMs)*0.2; }
-          ditMs = Math.max(15, Math.min(400, ditMs));
-          dahMs = Math.max(ditMs*2, Math.min(1200, dahMs)); // keep dah well above dit
-        }
-      } else {    // a space just ended
-        const u = ditMs;
+        if(!isDah) learn(dur);                 // a dit is one unit
+      } else {    // a gap just ended
         if(dur < MIN_MARK){ lastT=t; lastOn=on; return; } // ignore micro-dropout
-        if(dur < u*2){ /* gap within a character */ }
-        else if(dur < u*5){ flushChar(); }
-        else { flushChar(); if(out && !out.endsWith(" ")) out += " "; }
+        note(gaps, dur);
+        if(dur < unitMs*2){ learn(dur); }      // gap within a character, one unit: anchor the estimate
+        else if(dur < unitMs*5){ flushChar(); }                       // gap between characters (3u)
+        else { flushChar(); if(out && !out.endsWith(" ")) out += " "; } // gap between words (7u)
       }
       lastT=t; lastOn=on; emit();
     },
     // call periodically while idle to commit a trailing character
     idle(t){
       if(lastT===null || lastOn) return;
-      if(t - lastT > ditMs*5 && buffer){ flushChar(); emit(); }
+      if(t - lastT > unitMs*5 && buffer){ flushChar(); emit(); }
     }
   };
 }
@@ -592,8 +587,10 @@ function makeGate(opts){
     push(level, t){
       if(lastT===null){ floor=peak=level; lastT=t; }
       const dt=Math.max(1, t-lastT); lastT=t;
-      if(level<floor) floor=level; else floor += (level-floor)*Math.min(1, dt/FLOOR_TAU);
-      if(level>peak)  peak=level;  else peak  += (level-peak )*Math.min(1, dt/PEAK_TAU);
+      // Snap to new extremes instantly, but only let the envelope relax while OFF,
+      // so a long mark cannot drag the floor up into its own tone and clip itself.
+      if(level<floor) floor=level; else if(!on) floor += (level-floor)*Math.min(1, dt/FLOOR_TAU);
+      if(level>peak)  peak=level;  else if(!on) peak  += (level-peak )*Math.min(1, dt/PEAK_TAU);
       const span=peak-floor;
       let thr;
       if(opts.auto()){
@@ -839,7 +836,10 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, makeGate, detector
   function onDecoded(text, pending){
     $("rxText").textContent = text;
     $("rxMorse").textContent = pending ? Morse.pretty(pending) : "";
-    if(decoder) $("rxNote").textContent = "Estimated speed: "+decoder.wpm+" wpm";
+    if(decoder){
+      $("rxNote").className = "note";
+      $("rxNote").textContent = "~"+decoder.wpm+" wpm (unit "+Math.round(decoder.unit)+" ms)  ·  marks ["+decoder.marks.join(" ")+"]  ·  gaps ["+decoder.gaps.join(" ")+"]";
+    }
   }
 
   async function startListening(){
