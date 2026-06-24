@@ -334,9 +334,15 @@
 
     <div class="meter" id="meter" aria-hidden="true"><div class="fill" id="meterFill"></div><div class="thr" id="meterThr"></div></div>
 
+    <div class="row" style="margin-bottom:6px">
+      <label class="row" style="gap:7px;font-size:13px;color:var(--ink-dim)">
+        <input type="checkbox" id="autoLevel" checked> auto level (track noise floor and peak)
+      </label>
+    </div>
+
     <div class="sliders">
       <div class="slider">
-        <label for="thr">Threshold</label>
+        <label for="thr">Threshold (manual)</label>
         <output id="thrOut">0.20</output>
         <input type="range" id="thr" min="0.02" max="0.9" step="0.01" value="0.2">
       </div>
@@ -520,7 +526,9 @@ const Transmitter = (() => {
    ========================================================= */
 function makeDecoder(opts){
   let ditMs = Timing.unit(opts.wpm)||80;
+  let dahMs = ditMs*3;
   let buffer="", out="", lastOn=false, lastT=null;
+  const MIN_MARK = 18;   // marks shorter than this are noise, never code
   const cb = opts.onChange || (()=>{});
   function flushChar(){
     if(buffer){
@@ -529,26 +537,34 @@ function makeDecoder(opts){
     }
   }
   function emit(){ cb(out, buffer); }
+  function unit(){ return ditMs; }
   return {
     get unit(){ return ditMs; },
     get wpm(){ return Math.round(1200/ditMs); },
-    setWpm(w){ ditMs = Timing.unit(w); },
+    setWpm(w){ ditMs = Timing.unit(w); dahMs = ditMs*3; },
     reset(){ buffer=""; out=""; lastOn=false; lastT=null; emit(); },
     text(){ return out; },
     // a transition: signal became `on` at time `t` (ms)
     edge(on, t){
       if(lastT===null){ lastT=t; lastOn=on; return; }
       const dur = t - lastT;
-      if(lastOn){ // a mark ended
-        const isDah = dur > ditMs*2;
+      if(lastOn){ // a mark just ended
+        if(dur < MIN_MARK){ lastT=t; lastOn=on; return; } // reject spike
+        // classify against the midpoint of the dit and dah estimates
+        const boundary = (ditMs + dahMs) / 2;
+        const isDah = dur > boundary;
         buffer += isDah ? "-" : ".";
         if(opts.adaptive()){
-          const sample = isDah ? dur/3 : dur;
-          ditMs = Math.max(15, Math.min(400, ditMs*0.7 + sample*0.3));
+          if(isDah){ dahMs += (dur - dahMs)*0.2; }
+          else     { ditMs += (dur - ditMs)*0.2; }
+          ditMs = Math.max(15, Math.min(400, ditMs));
+          dahMs = Math.max(ditMs*2, Math.min(1200, dahMs)); // keep dah well above dit
         }
-      } else {    // a space ended
-        if(dur < ditMs*2){ /* intra-character */ }
-        else if(dur < ditMs*5){ flushChar(); }
+      } else {    // a space just ended
+        const u = ditMs;
+        if(dur < MIN_MARK){ lastT=t; lastOn=on; return; } // ignore micro-dropout
+        if(dur < u*2){ /* gap within a character */ }
+        else if(dur < u*5){ flushChar(); }
         else { flushChar(); if(out && !out.endsWith(" ")) out += " "; }
       }
       lastT=t; lastOn=on; emit();
@@ -562,62 +578,96 @@ function makeDecoder(opts){
 }
 
 /* =========================================================
+   Gate: turn a continuous 0..1 level into clean on/off.
+   Auto mode tracks the noise floor and signal peak and sets
+   the threshold between them, so it adapts to the room and
+   the source. Manual mode uses a fixed threshold.
+   ========================================================= */
+function makeGate(opts){
+  const ON=0.60, OFF=0.40, MIN_CONTRAST=0.06;
+  const FLOOR_TAU=1500, PEAK_TAU=2500; // ms time constants
+  let floor=0, peak=0, on=false, lastT=null;
+  return {
+    reset(){ floor=0; peak=0; on=false; lastT=null; },
+    push(level, t){
+      if(lastT===null){ floor=peak=level; lastT=t; }
+      const dt=Math.max(1, t-lastT); lastT=t;
+      if(level<floor) floor=level; else floor += (level-floor)*Math.min(1, dt/FLOOR_TAU);
+      if(level>peak)  peak=level;  else peak  += (level-peak )*Math.min(1, dt/PEAK_TAU);
+      const span=peak-floor;
+      let thr;
+      if(opts.auto()){
+        if(span < MIN_CONTRAST){ on=false; return {on, thr:1.01, floor, peak}; }
+        const thrOn=floor+span*ON, thrOff=floor+span*OFF;
+        on = on ? level>thrOff : level>thrOn;
+        thr = floor+span*0.5;
+      } else {
+        const m=opts.manual();
+        on = on ? level>m*0.6 : level>m;
+        thr = m;
+      }
+      return {on, thr, floor, peak};
+    }
+  };
+}
+
+/* =========================================================
    Detectors: signal sources (implement the shared contract)
    ========================================================= */
 const detectors = {};
 
 // --- Audio: RMS level from the microphone ---
-detectors.audio = function(getThreshold){
-  let ctx, stream, analyser, buf, raf, onSampleCb, on=false;
-  const HYST = 0.6, MINMS = 12; let lastFlip = 0;
+detectors.audio = function(gateOpts){
+  let ctx, stream, analyser, buf, timer, onSampleCb;
+  const gate = makeGate(gateOpts);
+  function rms(){
+    analyser.getByteTimeDomainData(buf);
+    let s=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; s+=v*v; }
+    return Math.min(1, Math.sqrt(s/buf.length)*3.2);
+  }
   async function start(onSample){
     onSampleCb = onSample;
     stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
     ctx = new (window.AudioContext||window.webkitAudioContext)();
     if(ctx.state==="suspended"){ try{ await ctx.resume(); }catch(e){} }
     const src = ctx.createMediaStreamSource(stream);
-    analyser = ctx.createAnalyser(); analyser.fftSize=2048; src.connect(analyser);
+    analyser = ctx.createAnalyser(); analyser.fftSize=512; src.connect(analyser); // ~12ms window, sharp edges
     buf = new Uint8Array(analyser.fftSize);
-    const loop = () => {
-      analyser.getByteTimeDomainData(buf);
-      let s=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; s+=v*v; }
-      const level = Math.min(1, Math.sqrt(s/buf.length)*3.2);
-      gate(level);
-      raf = requestAnimationFrame(loop);
-    };
-    loop();
-  }
-  function gate(level){
-    const thr = getThreshold();
-    const t = performance.now();
-    const onNow = on ? level > thr*HYST : level > thr;
-    if(onNow!==on && t-lastFlip>MINMS){ on=onNow; lastFlip=t; }
-    onSampleCb && onSampleCb(level, on, t);
+    timer = setInterval(() => {                      // ~200 Hz, finer than a 60fps frame
+      const level = rms(), t = performance.now();
+      const g = gate.push(level, t);
+      onSampleCb && onSampleCb(level, g.on, t, g);
+    }, 5);
   }
   function stop(){
-    cancelAnimationFrame(raf);
+    clearInterval(timer);
     stream && stream.getTracks().forEach(tr=>tr.stop());
-    ctx && ctx.close(); on=false;
+    ctx && ctx.close(); gate.reset();
   }
-  // ambient sampling for auto threshold
   async function sampleFloor(ms){
     return new Promise(res=>{
       let peak=0; const t0=performance.now();
       const id=setInterval(()=>{
-        analyser.getByteTimeDomainData(buf);
-        let s=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; s+=v*v; }
-        peak=Math.max(peak, Math.sqrt(s/buf.length)*3.2);
+        peak=Math.max(peak, rms());
         if(performance.now()-t0>ms){ clearInterval(id); res(peak); }
-      },30);
+      },20);
     });
   }
   return { start, stop, sampleFloor };
 };
 
 // --- Video: average luminance of the centre region ---
-detectors.video = function(getThreshold, getInvert){
-  let stream, raf, onSampleCb, on=false, video, canvas, cctx;
-  const HYST = 0.85, MINMS = 12; let lastFlip = 0;
+detectors.video = function(gateOpts, getInvert){
+  let stream, raf, onSampleCb, video, canvas, cctx;
+  const gate = makeGate(gateOpts);
+  function luma(){
+    cctx.drawImage(video, video.videoWidth*0.25, video.videoHeight*0.25,
+      video.videoWidth*0.5, video.videoHeight*0.5, 0,0,64,48);
+    const d = cctx.getImageData(0,0,64,48).data;
+    let sum=0; for(let i=0;i<d.length;i+=4){ sum += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; }
+    let level = sum/(d.length/4)/255;
+    return getInvert() ? 1-level : level;
+  }
   async function getStream(){
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
       throw new Error("Camera needs a secure context (https or localhost).");
@@ -649,44 +699,27 @@ detectors.video = function(getThreshold, getInvert){
     const loop = () => {
       if(video.videoWidth){
         try{
-          cctx.drawImage(video, video.videoWidth*0.25, video.videoHeight*0.25,
-            video.videoWidth*0.5, video.videoHeight*0.5, 0,0,64,48);
-          const d = cctx.getImageData(0,0,64,48).data;
-          let sum=0; for(let i=0;i<d.length;i+=4){ sum += 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; }
-          let level = sum/(d.length/4)/255;
-          if(getInvert()) level = 1-level;
-          gate(level);
+          const level = luma(), t = performance.now();
+          const g = gate.push(level, t);
+          onSampleCb && onSampleCb(level, g.on, t, g);
         }catch(e){}
       }
       raf = requestAnimationFrame(loop);
     };
     loop();
   }
-  function gate(level){
-    const thr=getThreshold(); const t=performance.now();
-    const onNow = on ? level > thr*HYST : level > thr;
-    if(onNow!==on && t-lastFlip>MINMS){ on=onNow; lastFlip=t; }
-    onSampleCb && onSampleCb(level, on, t);
-  }
   function stop(){
     cancelAnimationFrame(raf);
     stream && stream.getTracks().forEach(tr=>tr.stop());
-    if(video) video.srcObject=null; on=false;
+    if(video) video.srcObject=null; gate.reset();
   }
   async function sampleFloor(ms){
     return new Promise(res=>{
       let peak=0,t0=performance.now();
       const id=setInterval(()=>{
-        try{
-          cctx.drawImage(video, video.videoWidth*0.25, video.videoHeight*0.25,
-            video.videoWidth*0.5, video.videoHeight*0.5, 0,0,64,48);
-          const d=cctx.getImageData(0,0,64,48).data; let sum=0;
-          for(let i=0;i<d.length;i+=4){ sum+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; }
-          let lvl=sum/(d.length/4)/255; if(getInvert()) lvl=1-lvl;
-          peak=Math.max(peak,lvl);
-        }catch(e){}
+        try{ peak=Math.max(peak, luma()); }catch(e){}
         if(performance.now()-t0>ms){ clearInterval(id); res(peak); }
-      },30);
+      },20);
     });
   }
   return { start, stop, sampleFloor };
@@ -700,7 +733,7 @@ const Store = {
   set(k,v){ try{ localStorage.setItem("signalman:"+k, JSON.stringify(v)); }catch(e){} }
 };
 
-return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store };
+return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, makeGate, detectors, Store };
 })();
 
 /* =========================================================
@@ -783,13 +816,16 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
   let activeDetector=null, decoder=null, idleTimer=null, currentSrc="mic";
 
   function syncRx(){
-    $("thrOut").textContent = (+thr.value).toFixed(2);
+    const auto = $("autoLevel").checked;
+    $("thrOut").textContent = auto ? "auto" : (+thr.value).toFixed(2);
+    thr.disabled = auto;
     $("dwpmOut").textContent = $("adaptive").checked ? "auto" : dwpm.value+" wpm";
     dwpm.disabled = $("adaptive").checked;
-    meterThr.style.left = (thr.value*100)+"%";
+    if(!auto) meterThr.style.left = (thr.value*100)+"%";
   }
   [thr,dwpm].forEach(s=> s.addEventListener("input", ()=>{ syncRx(); if(decoder&&!$("adaptive").checked) decoder.setWpm(+dwpm.value); }));
   $("adaptive").addEventListener("change", syncRx);
+  $("autoLevel").addEventListener("change", syncRx);
 
   function setSource(src){
     currentSrc=src; root.dataset.src=src;
@@ -809,12 +845,14 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
   async function startListening(){
     try{
       decoder = makeDecoder({ wpm:+dwpm.value, adaptive:()=>$("adaptive").checked, onChange:onDecoded });
+      const gateOpts = { auto:()=>$("autoLevel").checked, manual:()=>+thr.value };
       activeDetector = currentSrc==="mic"
-        ? detectors.audio(()=>+thr.value)
-        : detectors.video(()=>+thr.value, ()=>$("invert").checked);
+        ? detectors.audio(gateOpts)
+        : detectors.video(gateOpts, ()=>$("invert").checked);
       let prevOn=false, primed=false;
-      const onSample = (level, isOn, t) => {
+      const onSample = (level, isOn, t, g) => {
         meterFill.style.width = Math.min(100, level*100)+"%";
+        if(g && isFinite(g.thr)) meterThr.style.left = Math.max(0, Math.min(100, g.thr*100))+"%";
         Lamp.level(Math.min(1, level), isOn);
         // The decoder measures durations between transitions, so only feed it
         // when the gated state actually changes (prime once with the start state).
@@ -894,8 +932,9 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
     if(!activeDetector || !activeDetector.sampleFloor){ $("rxNote").className="note"; $("rxNote").textContent="Start listening first, then calibrate against the ambient room."; return; }
     $("rxNote").className="note"; $("rxNote").textContent="Sampling ambient for 1.5 s. Keep the source quiet/dark...";
     const floor = await activeDetector.sampleFloor(1500);
+    $("autoLevel").checked = false;          // a measured threshold is a manual threshold
     thr.value = Math.min(0.9, Math.max(0.05, floor*1.6 + 0.04)); syncRx();
-    $("rxNote").textContent="Threshold set to "+(+thr.value).toFixed(2)+" above noise floor.";
+    $("rxNote").textContent="Switched to manual. Threshold set to "+(+thr.value).toFixed(2)+" above the noise floor.";
   };
 
   /* ---- reference chart ---- */
