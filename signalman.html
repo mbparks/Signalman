@@ -216,6 +216,7 @@
   .videobox{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#000;aspect-ratio:4/3;display:none}
   .videobox video{width:100%;height:100%;object-fit:cover;display:block}
   .videobox .roi{position:absolute;inset:25%;border:2px dashed rgba(255,255,255,.55);border-radius:8px;pointer-events:none}
+  .videobox .vidstatus{position:absolute;left:8px;bottom:8px;font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.06em;color:#dff;background:rgba(0,0,0,.55);padding:3px 9px;border-radius:6px}
   html[data-src=camera] .videobox{display:block}
 
   .decoded{background:var(--field);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:14px;min-height:74px}
@@ -329,7 +330,7 @@
       <button class="btn ghost" id="calBtn">Calibrate noise floor</button>
     </div>
 
-    <div class="videobox"><video id="video" playsinline muted></video><div class="roi"></div></div>
+    <div class="videobox"><video id="video" playsinline muted></video><div class="roi"></div><div class="vidstatus" id="vidstatus">idle</div></div>
 
     <div class="meter" id="meter" aria-hidden="true"><div class="fill" id="meterFill"></div><div class="thr" id="meterThr"></div></div>
 
@@ -814,8 +815,14 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
         Lamp.level(Math.min(1, level), isOn);
         decoder.edge(isOn, t);
       };
-      if(currentSrc==="mic") await activeDetector.start(onSample);
-      else await activeDetector.start(onSample, $("video"));
+      if(currentSrc==="mic"){
+        await activeDetector.start(onSample);
+      } else {
+        $("vidstatus").textContent = "requesting camera...";
+        await activeDetector.start(onSample, $("video"));
+        const v=$("video");
+        $("vidstatus").textContent = v.videoWidth ? ("live "+v.videoWidth+"x"+v.videoHeight) : "stream started";
+      }
 
       idleTimer = setInterval(()=> decoder.idle(performance.now()), 120);
       $("listenBtn").disabled=true; $("rxStopBtn").disabled=false;
@@ -831,6 +838,18 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
         else if(e.name==="NotReadableError") msg = dev+" is in use by another app. Close it and retry.";
         else if(e.message) msg = e.message;
       }
+      // Embedded previews (sandboxed iframes) commonly block capture with no prompt.
+      if(window.self !== window.top){
+        msg += " This page is running inside an embedded frame, which often blocks the camera and microphone. Open signalman.html in its own browser tab over https or localhost.";
+      }
+      // Probe what the page can actually see, to confirm a camera exists.
+      try{
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        const cams = devs.filter(d=>d.kind==="videoinput").length;
+        const mics = devs.filter(d=>d.kind==="audioinput").length;
+        msg += " (devices visible: "+cams+" camera, "+mics+" mic)";
+      }catch(_){}
+      $("vidstatus").textContent = e && e.name ? e.name : "error";
       $("rxNote").className="note warn";
       $("rxNote").textContent = msg;
       stopListening();
@@ -842,6 +861,7 @@ return { Morse, Timing, Tone, Lamp, Transmitter, makeDecoder, detectors, Store }
     $("listenBtn").disabled=false; $("rxStopBtn").disabled=true;
     $("srcMic").disabled=$("srcCam").disabled=false;
     meterFill.style.width="0%"; Lamp.flashOff();
+    if($("vidstatus")) $("vidstatus").textContent="idle";
     if(root.dataset.mode==="rx") $("stagelabel").textContent="Standing by";
   }
   $("listenBtn").onclick=startListening;
